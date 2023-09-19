@@ -9,19 +9,18 @@ use bitcoin::hashes::Hash;
 use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::PublicKey;
 use lightning::ln::channelmanager::{PaymentId, RecipientOnionFields, Retry};
-use lightning::ln::msgs::NetAddress;
-use lightning::ln::{PaymentHash, PaymentPreimage};
+use lightning::ln::msgs::SocketAddress;
+use lightning::ln::{PaymentHash, PaymentPreimage, ChannelId};
 use lightning::onion_message::OnionMessagePath;
 use lightning::onion_message::{CustomOnionMessageContents, Destination, OnionMessageContents};
 use lightning::routing::gossip::NodeId;
 use lightning::routing::router::{PaymentParameters, RouteParameters};
 use lightning::sign::{EntropySource, KeysManager};
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig};
-use lightning::util::persist::KVStorePersister;
 use lightning::util::ser::{Writeable, Writer};
 use lightning_invoice::payment::pay_invoice;
 use lightning_invoice::{utils, Bolt11Invoice, Currency};
-use lightning_persister::FilesystemPersister;
+use lightning_persister::fs_store::FilesystemStore;
 use std::env;
 use std::io;
 use std::io::Write;
@@ -38,7 +37,7 @@ pub(crate) struct LdkUserInfo {
 	pub(crate) bitcoind_rpc_host: String,
 	pub(crate) ldk_storage_dir_path: String,
 	pub(crate) ldk_peer_listening_port: u16,
-	pub(crate) ldk_announced_listen_addr: Vec<NetAddress>,
+	pub(crate) ldk_announced_listen_addr: Vec<SocketAddress>,
 	pub(crate) ldk_announced_node_name: [u8; 32],
 	pub(crate) network: Network,
 }
@@ -65,7 +64,7 @@ pub(crate) fn poll_for_user_input(
 	keys_manager: Arc<KeysManager>, network_graph: Arc<NetworkGraph>,
 	onion_messenger: Arc<OnionMessenger>, inbound_payments: Arc<Mutex<PaymentInfoStorage>>,
 	outbound_payments: Arc<Mutex<PaymentInfoStorage>>, ldk_data_dir: String, network: Network,
-	logger: Arc<disk::FilesystemLogger>, persister: Arc<FilesystemPersister>,
+	logger: Arc<disk::FilesystemLogger>, persister: Arc<FilesystemStore>,
 ) {
 	println!(
 		"LDK startup successful. Enter \"help\" to view available commands. Press Ctrl-D to quit."
@@ -247,7 +246,7 @@ pub(crate) fn poll_for_user_input(
 						expiry_secs.unwrap(),
 						Arc::clone(&logger),
 					);
-					persister.persist(INBOUND_PAYMENTS_FNAME, &*inbound_payments).unwrap();
+					// persister.persist(INBOUND_PAYMENTS_FNAME, &*inbound_payments).unwrap();
 				}
 				"connectpeer" => {
 					let peer_pubkey_and_ip_addr = words.next();
@@ -318,6 +317,7 @@ pub(crate) fn poll_for_user_input(
 					}
 					let mut channel_id = [0; 32];
 					channel_id.copy_from_slice(&channel_id_vec.unwrap());
+					let channel_id = ChannelId(channel_id);
 
 					let peer_pubkey_str = words.next();
 					if peer_pubkey_str.is_none() {
@@ -354,6 +354,7 @@ pub(crate) fn poll_for_user_input(
 					}
 					let mut channel_id = [0; 32];
 					channel_id.copy_from_slice(&channel_id_vec.unwrap());
+					let channel_id = ChannelId(channel_id);
 
 					let peer_pubkey_str = words.next();
 					if peer_pubkey_str.is_none() {
@@ -496,8 +497,8 @@ fn node_info(channel_manager: &Arc<ChannelManager>, peer_manager: &Arc<PeerManag
 	let chans = channel_manager.list_channels();
 	println!("\t\t num_channels: {}", chans.len());
 	println!("\t\t num_usable_channels: {}", chans.iter().filter(|c| c.is_usable).count());
-	let local_balance_msat = chans.iter().map(|c| c.balance_msat).sum::<u64>();
-	println!("\t\t local_balance_msat: {}", local_balance_msat);
+	// let local_balance_msat = chans.iter().map(|c| c.balance_msat).sum::<u64>();
+	// println!("\t\t local_balance_msat: {}", local_balance_msat);
 	println!("\t\t num_peers: {}", peer_manager.get_peer_node_ids().len());
 	println!("\t}},");
 }
@@ -515,7 +516,7 @@ fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<Netw
 	for chan_info in channel_manager.list_channels() {
 		println!("");
 		println!("\t{{");
-		println!("\t\tchannel_id: {},", hex_utils::hex_str(&chan_info.channel_id[..]));
+		println!("\t\tchannel_id: {},", hex_utils::hex_str(&chan_info.channel_id.0[..]));
 		if let Some(funding_txo) = chan_info.funding_txo {
 			println!("\t\tfunding_txid: {},", funding_txo.txid);
 		}
@@ -539,7 +540,7 @@ fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<Netw
 		}
 		println!("\t\tis_channel_ready: {},", chan_info.is_channel_ready);
 		println!("\t\tchannel_value_satoshis: {},", chan_info.channel_value_satoshis);
-		println!("\t\tlocal_balance_msat: {},", chan_info.balance_msat);
+		// println!("\t\tlocal_balance_msat: {},", chan_info.balance_msat);
 		if chan_info.is_usable {
 			println!("\t\tavailable_balance_for_send_msat: {},", chan_info.outbound_capacity_msat);
 			println!("\t\tavailable_balance_for_recv_msat: {},", chan_info.inbound_capacity_msat);
@@ -682,7 +683,7 @@ fn open_channel(
 
 fn send_payment(
 	channel_manager: &ChannelManager, invoice: &Bolt11Invoice,
-	outbound_payments: &mut PaymentInfoStorage, persister: Arc<FilesystemPersister>,
+	outbound_payments: &mut PaymentInfoStorage, persister: Arc<FilesystemStore>,
 ) {
 	let payment_hash = PaymentHash((*invoice.payment_hash()).into_inner());
 	let payment_secret = Some(*invoice.payment_secret());
@@ -695,7 +696,7 @@ fn send_payment(
 			amt_msat: MillisatAmount(invoice.amount_milli_satoshis()),
 		},
 	);
-	persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
+	// persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
 	match pay_invoice(invoice, Retry::Timeout(Duration::from_secs(10)), channel_manager) {
 		Ok(_payment_id) => {
 			let payee_pubkey = invoice.recover_payee_pub_key();
@@ -707,14 +708,14 @@ fn send_payment(
 			println!("ERROR: failed to send payment: {:?}", e);
 			print!("> ");
 			outbound_payments.payments.get_mut(&payment_hash).unwrap().status = HTLCStatus::Failed;
-			persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
+			// persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
 		}
 	};
 }
 
 fn keysend<E: EntropySource>(
 	channel_manager: &ChannelManager, payee_pubkey: PublicKey, amt_msat: u64, entropy_source: &E,
-	outbound_payments: &mut PaymentInfoStorage, persister: Arc<FilesystemPersister>,
+	outbound_payments: &mut PaymentInfoStorage, persister: Arc<FilesystemStore>,
 ) {
 	let payment_preimage = PaymentPreimage(entropy_source.get_secure_random_bytes());
 	let payment_hash = PaymentHash(Sha256::hash(&payment_preimage.0[..]).into_inner());
@@ -732,7 +733,7 @@ fn keysend<E: EntropySource>(
 			amt_msat: MillisatAmount(Some(amt_msat)),
 		},
 	);
-	persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
+	// persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
 	match channel_manager.send_spontaneous_payment_with_retry(
 		Some(payment_preimage),
 		RecipientOnionFields::spontaneous_empty(),
@@ -748,7 +749,7 @@ fn keysend<E: EntropySource>(
 			println!("ERROR: failed to send payment: {:?}", e);
 			print!("> ");
 			outbound_payments.payments.get_mut(&payment_hash).unwrap().status = HTLCStatus::Failed;
-			persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
+			// persister.persist(OUTBOUND_PAYMENTS_FNAME, &*outbound_payments).unwrap();
 		}
 	};
 }
@@ -797,7 +798,7 @@ fn get_invoice(
 }
 
 fn close_channel(
-	channel_id: [u8; 32], counterparty_node_id: PublicKey, channel_manager: Arc<ChannelManager>,
+	channel_id: ChannelId, counterparty_node_id: PublicKey, channel_manager: Arc<ChannelManager>,
 ) {
 	match channel_manager.close_channel(&channel_id, &counterparty_node_id) {
 		Ok(()) => println!("EVENT: initiating channel close"),
@@ -806,7 +807,7 @@ fn close_channel(
 }
 
 fn force_close_channel(
-	channel_id: [u8; 32], counterparty_node_id: PublicKey, channel_manager: Arc<ChannelManager>,
+	channel_id: ChannelId, counterparty_node_id: PublicKey, channel_manager: Arc<ChannelManager>,
 ) {
 	match channel_manager.force_close_broadcasting_latest_txn(&channel_id, &counterparty_node_id) {
 		Ok(()) => println!("EVENT: initiating channel force-close"),
