@@ -288,17 +288,23 @@ async fn handle_ldk_events(
 		}
 		Event::InvoiceRequestFailed { payment_id } => {},
 		Event::OpenChannelRequest {
-			ref temporary_channel_id, ref counterparty_node_id, ..
+			ref temporary_channel_id, ref counterparty_node_id, previous_splice_channel_id, ..
 		} => {
 			let mut random_bytes = [0u8; 16];
 			random_bytes.copy_from_slice(&keys_manager.get_secure_random_bytes()[..16]);
 			let user_channel_id = u128::from_be_bytes(random_bytes);
-			let res = channel_manager.accept_inbound_channel(
-				temporary_channel_id,
-				counterparty_node_id,
-				user_channel_id,
-			);
-
+			let res = if let Some(prev_channel_id) = previous_splice_channel_id {
+					channel_manager.accept_inbound_channel_from_trusted_peer_0conf(
+						temporary_channel_id,
+						counterparty_node_id,
+					user_channel_id)
+			} else {
+					channel_manager.accept_inbound_channel(
+						temporary_channel_id,
+						counterparty_node_id,
+						user_channel_id,
+					)
+			};
 			if let Err(e) = res {
 				print!(
 					"\nEVENT: Failed to accept inbound channel ({}) from {}: {:?}",
@@ -466,7 +472,35 @@ async fn handle_ldk_events(
 		Event::HTLCIntercepted { .. } => {}
 		Event::BumpTransaction(event) => bump_tx_event_handler.handle_event(&event),
 		Event::OpenNewSpliceChannel { prev_channel_id, counterparty_node_id, new_channel_value_satoshis, push_msat } => {
+			println!(
+				"\nEVENT: Splicing out of channel {} with peer {} to open a new channel with value {} and push {}",
+				hex_utils::hex_str(&prev_channel_id.0),
+				hex_utils::hex_str(&counterparty_node_id.serialize()),
+				new_channel_value_satoshis,
+				push_msat
+			);
+			let mut random_bytes = [0u8; 16];
+			random_bytes.copy_from_slice(&keys_manager.get_secure_random_bytes()[..16]);
+			let user_channel_id = u128::from_be_bytes(random_bytes);
+			let res = channel_manager.create_channel_from_splice(counterparty_node_id,
+				new_channel_value_satoshis, push_msat, user_channel_id, None, prev_channel_id);
 
+			match res {
+				Err(e) => print!(
+					"\nEVENT: Failed to open new spliced channel ({}) from {}: {:?}",
+					hex_utils::hex_str(&prev_channel_id.0[..]),
+					hex_utils::hex_str(&counterparty_node_id.serialize()),
+					e,
+				),
+				Ok(new_channel_id) => print!(
+					"\nEVENT: Opening new spliced channel ({}) from {} (previous channel {})",
+					hex_utils::hex_str(&new_channel_id.0[..]),
+					hex_utils::hex_str(&counterparty_node_id.serialize()),
+					hex_utils::hex_str(&prev_channel_id.0[..]),
+				)
+			}
+			print!("> ");
+			io::stdout().flush().unwrap();
 		}
 	}
 }
@@ -613,6 +647,7 @@ async fn start_ldk() {
 	user_config.channel_handshake_limits.force_announced_channel_preference = false;
 	user_config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = true;
 	user_config.manually_accept_inbound_channels = true;
+	user_config.channel_config.support_splice_out = true;
 	let mut restarting_node = true;
 	let (channel_manager_blockhash, channel_manager) = {
 		if let Ok(mut f) = fs::File::open(format!("{}/manager", ldk_data_dir.clone())) {

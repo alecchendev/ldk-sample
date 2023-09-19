@@ -300,6 +300,48 @@ pub(crate) fn poll_for_user_input(
 					}
 				}
 				"listchannels" => list_channels(&channel_manager, &network_graph),
+				"spliceout" => {
+					let channel_id_str = words.next();
+					if channel_id_str.is_none() {
+						println!("ERROR: closechannel requires a channel ID: `closechannel <channel_id> <peer_pubkey>`");
+						continue;
+					}
+					let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
+					if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
+						println!("ERROR: couldn't parse channel_id");
+						continue;
+					}
+					let mut channel_id = [0; 32];
+					channel_id.copy_from_slice(&channel_id_vec.unwrap());
+					let channel_id = ChannelId(channel_id);
+
+					let peer_pubkey_str = words.next();
+					if peer_pubkey_str.is_none() {
+						println!("ERROR: closechannel requires a peer pubkey: `closechannel <channel_id> <peer_pubkey>`");
+						continue;
+					}
+					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+						Some(peer_pubkey_vec) => peer_pubkey_vec,
+						None => {
+							println!("ERROR: couldn't parse peer_pubkey");
+							continue;
+						}
+					};
+					let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
+						Ok(peer_pubkey) => peer_pubkey,
+						Err(_) => {
+							println!("ERROR: couldn't parse peer_pubkey");
+							continue;
+						}
+					};
+					let splice_value_sat = words.next();
+					let splice_value_sat: Result<u64, _> = splice_value_sat.unwrap().parse();
+					if splice_value_sat.is_err() {
+						println!("ERROR: channel amount must be a number");
+						continue;
+					}
+					splice_out(channel_id, peer_pubkey, splice_value_sat.unwrap(), channel_manager.clone());
+				},
 				"listpayments" => list_payments(
 					&inbound_payments.lock().unwrap(),
 					&outbound_payments.lock().unwrap(),
@@ -473,6 +515,7 @@ fn help() {
 	println!("      closechannel <channel_id> <peer_pubkey>");
 	println!("      forceclosechannel <channel_id> <peer_pubkey>");
 	println!("      listchannels");
+	println!("      spliceout <channel_id> <peer_pubkey> <amt_satoshis>");
 	println!("\n  Peers:");
 	println!("      connectpeer pubkey@host:port");
 	println!("      disconnectpeer <peer_pubkey>");
@@ -795,6 +838,17 @@ fn get_invoice(
 			amt_msat: MillisatAmount(Some(amt_msat)),
 		},
 	);
+}
+
+fn splice_out(
+	channel_id: ChannelId, counterparty_node_id: PublicKey,
+	amount_satoshis: u64, channel_manager: Arc<ChannelManager>
+) {
+	println!("channel_id: {:?}, counterparty_node_id: {:?}, amount_satoshis: {:?}", channel_id, counterparty_node_id, amount_satoshis);
+	match channel_manager.splice_out(&channel_id, &counterparty_node_id, None, amount_satoshis, None) {
+		Ok(()) => println!("EVENT: initiating splice-out"),
+		Err(e) => println!("ERROR: failed to splice-out: {:?}", e),
+	}
 }
 
 fn close_channel(
